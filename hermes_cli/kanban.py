@@ -360,6 +360,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
                     "use 1 to trip on the first failure.", 2)
+    max_review_rounds = getattr(args, "max_review_rounds", None)
+    if max_review_rounds is not None and max_review_rounds < 0:
+        return _err(f"kanban: --max-review-rounds must be >= 0 (got {max_review_rounds}); "
+                    "0 disables the cap.", 2)
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(
             conn, title=args.title, body=body, assignee=args.assignee,
@@ -369,7 +373,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
             idempotency_key=getattr(args, "idempotency_key", None),
             max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
-            max_retries=max_retries, model_override=getattr(args, "model_override", None),
+            max_retries=max_retries, max_review_rounds=max_review_rounds,
+            model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
@@ -525,6 +530,18 @@ def _cmd_show(args: argparse.Namespace) -> int:
             print(f"  max-retries: {int(cfg_val)} (config kanban.failure_limit)")
         else:
             print(f"  max-retries: {kb.DEFAULT_FAILURE_LIMIT} (default)")
+    # Effective review/rework round cap (task > config > default 0 = disabled).
+    if task.max_review_rounds is not None:
+        print(f"  max-review-rounds: {task.max_review_rounds} (task)")
+    else:
+        try:
+            cfg_cap = int(_kanban_config().get("max_review_rounds") or 0)
+        except (TypeError, ValueError):
+            cfg_cap = 0
+        if cfg_cap > 0:
+            print(f"  max-review-rounds: {cfg_cap} (config kanban.max_review_rounds)")
+        else:
+            print("  max-review-rounds: 0 (disabled)")
     field("created", f"{_fmt_ts(task.created_at)} by {task.created_by or '-'}")
 
     # Diagnostics up top so CLI users see distress signals before scrolling.
@@ -1027,7 +1044,10 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     author = _profile_author() if reason else None
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
+        reset_rework = bool(getattr(args, "reset_rework", False))
+        op = _commented(conn, reason, author, "UNBLOCK",
+                        lambda tid: kb.unblock_task(conn, tid, reset_rework=reset_rework))
+        suffix = suffix + (" (rework budget reset)" if reset_rework else "")
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
 

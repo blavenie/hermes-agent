@@ -464,7 +464,7 @@ Dispatcher-owned workers receive their task lifecycle tools automatically.
 | `kanban_list` | List task summaries with filters for `assignee`, `status`, `tenant`, archived visibility, and limit. Intended for orchestrators discovering board work. | — |
 | `kanban_complete` | Finish with `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
 | `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
-| `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
+| `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting — unless `kanban.max_review_rounds` is reached, in which case the card is parked `blocked` (`needs_input`) and a `rework_cap_reached` event is emitted. | `reason` |
 | `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes when an incomplete parent finishes; with no open parent it is recorded as `needs_input` instead, since the wait could never be satisfied), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
 | `kanban_comment` | Append a durable note to the task thread. | `task_id`, `body` |
@@ -970,7 +970,7 @@ hermes kanban comment <id> "<text>" [--author NAME]
 # Bulk verbs — accept multiple ids:
 hermes kanban complete <id>... [--result "..."] [--force]
 hermes kanban block <id> "<reason>" [--ids <id>...]
-hermes kanban unblock <id>...
+hermes kanban unblock <id>... [--reset-rework]
 hermes kanban archive <id>...
 
 hermes kanban request-review <id> [--summary "..."] [--metadata JSON] [--reviewer PROFILE]
@@ -1006,6 +1006,8 @@ All commands are also available as a slash command in the interactive CLI and in
 
 `--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
 
+`--max-review-rounds` caps the review/rework loop. When the Nth `changes_requested` verdict arrives, the card is parked `blocked` with kind `needs_input` (reason `rework_round=N/max (reviewer: <profile>)`) and a single `rework_cap_reached` event carrying the run ids — the reviewer's findings stay on the card and a human decides what happens next. `0` disables the cap (the default). A plain `hermes kanban unblock <id>` does not reset the counter (so it cannot defeat the cap); pass `--reset-rework` to grant another N rounds and record a `rework_reset` event. The cap is enforced in `request_changes()`, so the CLI and the dashboard route share the same choke point. It counts `task_runs` rows with `outcome='changes_requested'` since the last reset — no schema-only counting hacks.
+
 ### Concurrency, scheduling, and child promotion config
 
 | Config key | Default | What it does |
@@ -1015,6 +1017,7 @@ All commands are also available as a slash command in the interactive CLI and in
 | `kanban.dispatch_profiles` | unset (any existing profile) | Per-home claim allowlist for boards shared across Hermes homes. When the key is present, this home's dispatcher only claims cards whose assignee is listed — fail-closed: an empty list, `null` or a bare `dispatch_profiles:` claims nothing, and a config read that fails logs a warning and claims nothing; other assignees land in `skipped_nonspawnable`. Only omitting the key means "any existing profile". `hermes kanban diagnostics` prints the resolved value for this home (`any`, the listed names, or `none (fail-closed: …)`). See [Shared boards across homes](#shared-boards-across-homes). |
 | `kanban.auto_promote_children` | `true` | After `decompose_triage_task()` produces children with no parent-blocker dependencies, they're automatically promoted to `ready` so the dispatcher can pick them up. Set to `false` to require manual review — children stay in `todo` until you promote them. |
 | `kanban.default_workdir` | unset | Board-level default working directory applied to new tasks when neither `--workspace` nor the task itself overrides it. Per-task `workspace:` still wins. |
+| `kanban.max_review_rounds` | `0` (disabled) | Caps how many review/rework rounds a card may cycle through. The Nth `changes_requested` verdict parks the card `blocked` (kind `needs_input`) with reason `rework_round=N/max (reviewer: <profile>)` and emits one `rework_cap_reached` event carrying the run ids, instead of routing it back to the implementer again. A plain `unblock` leaves the cap in force; `hermes kanban unblock <id> --reset-rework` grants a fresh budget and records a `rework_reset` event. Per-card override: `hermes kanban create ... --max-review-rounds N` (0 disables for that card). |
 
 ```yaml
 kanban:

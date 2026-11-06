@@ -196,6 +196,11 @@ _SPECS = [
                   f"first failure (no retries), --max-retries 3 allows two retries. Omit to use "
                   f"the dispatcher's kanban.failure_limit config (default "
                   f"{kb.DEFAULT_FAILURE_LIMIT})."),
+        _arg("--max-review-rounds", type=int, metavar="N", dest="max_review_rounds",
+             help="Per-task cap on review/rework rounds. The Nth "
+                  f"'changes requested' verdict blocks the card with kind 'needs_input' instead of "
+                  f"routing it back again; 0 disables the cap. Omit to use kanban.max_review_rounds "
+                  f"(default {kb.DEFAULT_MAX_REVIEW_ROUNDS})."),
         _arg("--model", dest="model_override",
              help="Pin the worker to this model (passed as -m <model>) without "
                   "changing the profile's configured model. Combine with --provider "
@@ -330,6 +335,10 @@ _SPECS = [
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
+        _arg("--reset-rework", action="store_true", dest="reset_rework",
+             help="Also grant a fresh review/rework round budget: records a rework_reset "
+                  "event so the next N 'changes requested' verdicts are allowed again. "
+                  "Without this flag the cap stays in force across a plain unblock."),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
     _cmd("request-review", [

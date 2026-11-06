@@ -854,6 +854,11 @@ def config_from_kanban_config(kanban_cfg: Optional[dict]) -> dict:
     diag_cfg.setdefault(
         "failure_limit", kanban_cfg.get("failure_limit", DEFAULT_CONFIG["failure_threshold"]),
     )
+    # Carry the review/rework cap so diagnostics consumers see the effective
+    # value the same way they already see the failure breaker threshold.
+    diag_cfg.setdefault(
+        "max_review_rounds", kanban_cfg.get("max_review_rounds", 0),
+    )
     if not _has_explicit_threshold(diag_cfg):
         diag_cfg["failure_threshold"] = diag_cfg["failure_limit"]
     return diag_cfg

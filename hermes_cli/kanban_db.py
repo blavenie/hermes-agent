@@ -113,6 +113,10 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
+
+# Default cap on review/rework rounds per card (``kanban.max_review_rounds``).
+# 0 = disabled, so upgrading never changes an existing board's behaviour.
+DEFAULT_MAX_REVIEW_ROUNDS = 0
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 
@@ -629,6 +633,9 @@ class Task:
     reasoning_effort: Optional[str] = None   # VALID_REASONING_EFFORTS | "none"; NULL = profile's
     # Breaker trip count; None -> ``kanban.failure_limit`` -> DEFAULT_FAILURE_LIMIT.
     max_retries: Optional[int] = None
+    # Review/rework round cap; None -> ``kanban.max_review_rounds`` ->
+    # DEFAULT_MAX_REVIEW_ROUNDS. 0 explicitly disables the cap for this card.
+    max_review_rounds: Optional[int] = None
     # ``/goal``-style loop: a judge re-checks each turn IN THE SAME SESSION until
     # done / budget exhausted (-> kanban_block); ``goal_max_turns`` None -> goals default.
     goal_mode: bool = False
@@ -669,7 +676,8 @@ _TASK_EPOCH_COLUMNS = ("created_at", "started_at", "completed_at", "claim_expire
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id", "completion_contract",
+    "current_step_key", "max_retries", "max_review_rounds", "session_id",
+    "completion_contract",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -845,6 +853,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- case) falls through to the dispatcher-level ``kanban.failure_limit``
     -- config and then ``DEFAULT_FAILURE_LIMIT``.
     max_retries          INTEGER,
+    -- Per-task override for the review/rework round cap. NULL falls through
+    -- to ``kanban.max_review_rounds``; 0 explicitly disables the cap for this
+    -- card. Rounds are counted from ``task_runs`` rows with
+    -- outcome='changes_requested' since the last ``rework_reset`` event, so a
+    -- plain unblock never grants a fresh round.
+    max_review_rounds    INTEGER,
     -- When 1, the dispatched worker runs in a Ralph-style goal loop: an
     -- auxiliary judge re-evaluates the worker's response against the
     -- card title/body after each turn and feeds a continuation prompt
@@ -1161,7 +1175,8 @@ def create_task(
     branch_name: Optional[str] = None, tenant: Optional[str] = None, priority: int = 0,
     parents: Iterable[str] = (), triage: bool = False, idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
-    max_retries: Optional[int] = None, model_override: Optional[str] = None,
+    max_retries: Optional[int] = None, max_review_rounds: Optional[int] = None,
+    model_override: Optional[str] = None,
     provider_override: Optional[str] = None, reasoning_effort: Optional[str] = None,
     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
@@ -1190,6 +1205,8 @@ def create_task(
     completion_contract = validate_contract(completion_contract)
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    if max_review_rounds is not None and int(max_review_rounds) < 0:
+        raise ValueError("max_review_rounds must be >= 0 (0 disables the cap)")
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -1265,10 +1282,10 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, model_override, provider_override,
+                        skills, max_retries, max_review_rounds, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1276,7 +1293,8 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         _opt_int(max_runtime_seconds),
                         json.dumps(skills_list) if skills_list is not None else None,
-                        _opt_int(max_retries), model_override, provider_override, reasoning_effort,
+                        _opt_int(max_retries), _opt_int(max_review_rounds),
+                        model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
                     ),
                 )
@@ -3405,6 +3423,57 @@ def _nonblank_str(value: Any) -> Optional[str]:
     return value if isinstance(value, str) and value.strip() else None
 
 
+def _kanban_max_review_rounds_default() -> int:
+    """``kanban.max_review_rounds`` from config.yaml; 0 when absent/unreadable."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly()
+        kanban_cfg = cfg.get("kanban") if isinstance(cfg, dict) else None
+        raw = (
+            kanban_cfg.get("max_review_rounds", DEFAULT_MAX_REVIEW_ROUNDS)
+            if isinstance(kanban_cfg, dict)
+            else DEFAULT_MAX_REVIEW_ROUNDS
+        )
+        value = int(raw)
+    except Exception:
+        return DEFAULT_MAX_REVIEW_ROUNDS
+    return value if value >= 0 else DEFAULT_MAX_REVIEW_ROUNDS
+
+
+def _effective_max_review_rounds(task_value: Any) -> int:
+    """Per-card override when set (0 disables), else the config default."""
+    if task_value is not None:
+        try:
+            return max(0, int(task_value))
+        except (TypeError, ValueError):
+            pass
+    return _kanban_max_review_rounds_default()
+
+
+def _changes_requested_run_ids(conn: sqlite3.Connection, task_id: str) -> list[int]:
+    """Run ids whose outcome is ``changes_requested``, oldest first."""
+    rows = conn.execute(
+        "SELECT id FROM task_runs WHERE task_id = ? AND outcome = 'changes_requested' "
+        "ORDER BY id", (task_id,),
+    ).fetchall()
+    return [int(row["id"]) for row in rows]
+
+
+def _review_rounds_used(conn: sqlite3.Connection, task_id: str) -> int:
+    """Rework rounds consumed since the last ``rework_reset`` event."""
+    total = len(_changes_requested_run_ids(conn, task_id))
+    reset_event = _latest_event(conn, task_id, "rework_reset")
+    baseline = 0
+    if reset_event is not None:
+        payload = _json_dict(_row_get(reset_event, "payload"))
+        try:
+            baseline = max(0, int(payload.get("rounds_before") or 0))
+        except (TypeError, ValueError):
+            baseline = 0
+    return max(0, total - baseline)
+
+
 def request_changes(
     conn: sqlite3.Connection, task_id: str, *, reason: str, expected_run_id: Optional[int] = None,
 ) -> tuple[bool, Optional[str]]:
@@ -3417,7 +3486,8 @@ def request_changes(
 
     with write_txn(conn):
         task_row = conn.execute(
-            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status, assignee, current_run_id, max_review_rounds "
+            "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if task_row is None:
             return False, "task not found"
@@ -3441,6 +3511,15 @@ def request_changes(
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
 
         new_status = _landing_status_after_parents(conn, task_id)
+        cap = _effective_max_review_rounds(_row_get(task_row, "max_review_rounds"))
+        rounds_used = _review_rounds_used(conn, task_id) + 1
+        capped = cap > 0 and rounds_used >= cap
+        set_extra = ""
+        extra_params: tuple[Any, ...] = ()
+        if capped:
+            new_status = "blocked"
+            set_extra = ", block_kind = ?"
+            extra_params = ("needs_input",)
         # consecutive_failures deliberately PRESERVED: a review transition is
         # not evidence the pathology cleared; only complete_task resets it.
         cur = conn.execute(
@@ -3451,9 +3530,10 @@ def request_changes(
                    claim_lock = NULL,
                    claim_expires = NULL,
                    worker_pid = NULL, worker_started_at = NULL
+            """ + set_extra + """
              WHERE id = ? AND status = 'running' AND current_run_id = ?
             """,
-            (new_status, implementer, task_id, int(current_run_id)),
+            (new_status, implementer, *extra_params, task_id, int(current_run_id)),
         )
         if cur.rowcount != 1:
             return False, "task changed during review handoff"
@@ -3469,9 +3549,29 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
+                "capped": capped,
             },
             run_id=run_id,
         )
+        if capped:
+            cap_reason = f"rework_round={rounds_used}/{cap} (reviewer: {reviewer or 'unknown'})"
+            # A "blocked" event makes the cap sticky: recompute_ready's
+            # _has_sticky_block keeps the card parked until an explicit unblock
+            # (a plain unblock does NOT reset the round counter).
+            _append_event(conn, task_id, "blocked", {
+                "reason": cap_reason,
+                "kind": "needs_input",
+                "source_status": "running",
+                "rework_cap": True,
+            }, run_id=run_id)
+            _append_event(conn, task_id, "rework_cap_reached", {
+                "reason": cap_reason,
+                "round": rounds_used,
+                "max": cap,
+                "reviewer": reviewer,
+                "run_ids": _changes_requested_run_ids(conn, task_id),
+            }, run_id=run_id)
+            return True, f"blocked — {cap_reason}"
     return True, implementer
 
 
@@ -3554,9 +3654,13 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(conn: sqlite3.Connection, task_id: str, *, reset_rework: bool = False) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
-    when that is where it left off), closing any leaked run first."""
+    when that is where it left off), closing any leaked run first.
+
+    ``reset_rework`` grants a fresh review/rework budget: the round counter is
+    measured from a ``rework_reset`` event's ``rounds_before`` baseline, so a
+    plain unblock (the default) leaves the cap in force."""
     now = int(time.time())
     with write_txn(conn):
         resume_status = (
@@ -3595,6 +3699,10 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                 else None
             ),
         )
+        if reset_rework:
+            _append_event(conn, task_id, "rework_reset", {
+                "rounds_before": len(_changes_requested_run_ids(conn, task_id)),
+            })
         return True
 
 

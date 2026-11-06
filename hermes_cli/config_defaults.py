@@ -1885,6 +1885,12 @@ DEFAULT_CONFIG = {
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
         # crashed) for the same task/profile. Reassignment resets the streak.
         "failure_limit": 2,
+        # Cap review/rework rounds per card: the Nth "changes requested" verdict parks the
+        # card blocked (kind needs_input) instead of routing it back to the implementer.
+        # 0 disables the cap (default, so upgrades never change existing boards). A card
+        # override via ``kanban create --max-review-rounds N`` wins; ``unblock --reset-rework``
+        # grants a fresh budget.
+        "max_review_rounds": 0,
         # Worker stdout/stderr log rotation at spawn time (2 MiB + one backup). Raise to keep more
         # early failure evidence from long-running workers.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,

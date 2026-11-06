@@ -38,6 +38,7 @@ class _DispatcherSettings:
     max_spawn: Any
     max_in_progress: Optional[int]
     failure_limit: int
+    max_review_rounds: int
     stale_timeout_seconds: int
     reconcile_orphans: bool
     default_assignee: Optional[str]
@@ -83,6 +84,22 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
                        raw_failure_limit, kb.DEFAULT_FAILURE_LIMIT)
         failure_limit = kb.DEFAULT_FAILURE_LIMIT
 
+    # 0 disables the review/rework round cap (the default, so upgrades keep
+    # existing boards' behaviour). Enforced by request_changes(), not here.
+    raw_max_review_rounds = kanban_cfg.get("max_review_rounds", kb.DEFAULT_MAX_REVIEW_ROUNDS)
+    try:
+        max_review_rounds = int(raw_max_review_rounds)
+    except (TypeError, ValueError):
+        logger.warning("kanban dispatcher: invalid kanban.max_review_rounds=%r; using default %d",
+                       raw_max_review_rounds, kb.DEFAULT_MAX_REVIEW_ROUNDS)
+        max_review_rounds = kb.DEFAULT_MAX_REVIEW_ROUNDS
+    if max_review_rounds < 0:
+        logger.warning("kanban dispatcher: kanban.max_review_rounds=%r is below 0; using default %d",
+                       raw_max_review_rounds, kb.DEFAULT_MAX_REVIEW_ROUNDS)
+        max_review_rounds = kb.DEFAULT_MAX_REVIEW_ROUNDS
+    if max_review_rounds > 0:
+        logger.info("kanban dispatcher: max_review_rounds=%d", max_review_rounds)
+
     # 0 disables stale detection.
     raw_stale = kanban_cfg.get("dispatch_stale_timeout_seconds", 0)
     try:
@@ -107,6 +124,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         max_spawn=max_spawn,
         max_in_progress=effective_max_in_progress,
         failure_limit=failure_limit,
+        max_review_rounds=max_review_rounds,
         stale_timeout_seconds=stale_timeout_seconds,
         # Requeue 'running' cards with broken claim bookkeeping (zombie-card
         # reconciliation); false keeps orphans frozen for manual forensics.
